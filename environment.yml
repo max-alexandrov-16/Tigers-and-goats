@@ -1,0 +1,8 @@
+name: bag_chal
+channels:
+  - defaults
+  - pytorch
+dependencies:
+  - numpy
+  - matplotlib
+  - pytorch=2.0.1
