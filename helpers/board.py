@@ -34,7 +34,7 @@ class Board():
         #intialize the board
         self.state = np.zeros(((size,size)),dtype = int)
         #max number of goats
-        self.max_number_of_goats  = self.size**2 - 2
+        self.max_number_of_goats  = self.size**2 - 5
         self.eaten_goats = 0
 
         self.place_tigers_in_corners()

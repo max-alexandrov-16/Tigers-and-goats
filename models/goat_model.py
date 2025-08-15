@@ -200,3 +200,61 @@ class CriticModel(nn.Module):
         """
         value = self.forward(model_input)
         return value.squeeze()  # Remove batch dimension
+    
+
+class CNNCriticModel(nn.Module):
+    def __init__(self, size):
+        super(CNNCriticModel, self).__init__()
+        self.size = size
+        self.input_size = self.size ** 2 + 1  # For compatibility
+        self.flag_dim = 1
+
+        # Convolutional layers for board input
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.layer_norm1 = nn.LayerNorm([64, size // 2, size // 2])
+
+        # Fully connected layers
+        conv_output_dim = (size // 2) * (size // 2) * 64  # After one pooling layer
+        self.fc1 = nn.Linear(conv_output_dim + self.flag_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.output = nn.Linear(128, 1)
+
+    def forward(self, x):
+        # Separate board and flag
+        board = x[:, :-1]
+        flag = x[:, -1].unsqueeze(1)  # shape: [B, 1]
+
+        # Reshape board to [B, 1, H, W]
+        board = board.view(-1, 1, self.size, self.size)
+
+        # CNN layers
+        x = F.relu(self.conv1(board))
+        x = F.relu(self.conv2(x))
+        x = self.pool(F.relu(self.conv3(x)))
+        x = self.layer_norm1(x)
+
+        # Flatten and concatenate flag
+        x = x.view(x.size(0), -1)
+        x = torch.cat([x, flag], dim=1)
+
+        # Fully connected layers
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.output(x)
+        return x
+
+    def predict_value(self, model_input):
+        """
+        Predicts the state value for a given environment state.
+
+        Args:
+            model_input (torch.Tensor): Shape [1, input_size] – flattened board + flag.
+
+        Returns:
+            torch.Tensor: A scalar tensor representing value.
+        """
+        return self.forward(model_input).squeeze()

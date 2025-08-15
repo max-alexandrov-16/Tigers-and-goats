@@ -39,6 +39,8 @@ class GOAT_ENV():
             reward = self.goat_reward_scheme["winning"]
             return reward
         self.board,tiger_reward = move_tiger(self.board, None,self.tiger_reward_scheme)
+        if tiger_reward == self.tiger_reward_scheme["eating"]:
+            reward = self.goat_reward_scheme["eaten"]
         self.turn += 1
         tiger_won = self.board.check_tiger_win(turn=self.turn)
         if tiger_won:

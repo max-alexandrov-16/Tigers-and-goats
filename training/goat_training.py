@@ -12,24 +12,36 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from argparse import Namespace
 from agents.goat_agent import ActorCriticGoatAgent
-from models.goat_model import ActorModel,CNNActorModel, CriticModel
+from models.goat_model import ActorModel,CNNActorModel, CriticModel, CNNCriticModel
 from helpers.goat_env import GOAT_ENV
 
 
-def save_metrics(log_path, run_index, avg_reward, critic_loss):
-    with open(log_path, "a") as f:
-        f.write(json.dumps({
-            "run": run_index,
-            "avg_reward": avg_reward,
-            "critic_loss": critic_loss
-        }) + "\n")
+def save_metrics(
+    log_path,
+    run_index,
+    avg_reward,
+    avg_critic_loss,
+    avg_entropy="",
+    avg_step_count="",
+    **kl_divergences  # e.g., monitoring_state_1_KL=..., etc.
+):
+    data = {
+        "run": run_index,
+        "avg_reward": avg_reward,
+        "avg_critic_loss": avg_critic_loss,
+        "avg_entropy": avg_entropy,
+        "avg_step_count": avg_step_count,
+        **kl_divergences
+    }
 
+    with open(log_path, "a") as f:
+        f.write(json.dumps(data) + "\n")
 
 
 args = Namespace(
-    runs=200000,
+    runs=300000,
     log_step=2000,
-    max_turns=30,
+    max_turns=40,
     size=5
 )
 
@@ -60,12 +72,12 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
 
     log_file = os.path.join(log_dir, "metrics.jsonl")
 
-    goat_reward_scheme = {"winning": 1, "losing": -1}
+    goat_reward_scheme = {"winning": 1, "losing": -1, "eaten": -0.2}
     tiger_reward_scheme = {"eating": 0.1, "winning": 0.5, "losing": -0.5, "no score": 0}
     goat_env = GOAT_ENV(args.size, args.max_turns, goat_reward_scheme, tiger_reward_scheme)
 
     actor_model = CNNActorModel(args.size)
-    critic_model = CriticModel(args.size)
+    critic_model = CNNCriticModel(args.size)
     actor_optimizer = torch.optim.Adam(actor_model.parameters(), lr=actor_lr)
     critic_optimizer = torch.optim.Adam(critic_model.parameters(), lr=critic_lr, weight_decay=critic_weight_decay)
 
@@ -79,28 +91,78 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
 
     avg_rewards = []
     critic_losses = []
+    entropies = []
+    kl_divergences = []
+    step_counts = []
 
     for i in range(args.runs):
         try:
-            avg_reward, critic_loss = goat_agent.learn()
+            monitoring_states = [
+                goat_agent.monitoring_state_and_flag_1,
+                goat_agent.monitoring_state_and_flag_2,
+                goat_agent.monitoring_state_and_flag_3,
+            ]
+
+            if any(state is None for state in monitoring_states):
+                reward, critic_loss, entropy,length = goat_agent.learn(record_monitoring_states=True)
+            else:
+                reward, critic_loss, entropy,length = goat_agent.learn(record_monitoring_states=False)
+                kl_div = goat_agent.monitor_KL_divergence_multiple_states()
+                kl_divergences.append(kl_div)
+
             goat_agent.clear_memory()
-            avg_rewards.append(avg_reward)
+            avg_rewards.append(reward)
             critic_losses.append(critic_loss)
+            entropies.append(entropy)
+            step_counts.append(length)
+
 
             if i % args.log_step == 0 and i != 0:
                 avg_r = np.mean(avg_rewards[-args.log_step:])
                 avg_l = np.mean(critic_losses[-args.log_step:])
-                print(f"[{experiment_name} | Run {i}] Avg Reward: {avg_r:.4f} | Critic Loss: {avg_l:.4f}")
-                save_metrics(log_file, i, avg_r, avg_l)
+                avg_e = np.mean(entropies[-args.log_step:])
+                avg_s = np.mean(step_counts[-args.log_step:])
 
-                # === Save checkpoint ===
-                checkpoint = {
-                    'actor_model_state_dict': actor_model.state_dict(),
-                    'critic_model_state_dict': critic_model.state_dict(),
-                    'actor_optimizer_state_dict': actor_optimizer.state_dict(),
-                    'critic_optimizer_state_dict': critic_optimizer.state_dict(),
-                    'step': i
+                # Compute average KLs across log_step
+                avg_kl_dict = {}
+                if kl_divergences:
+                    # Gather all unique keys in the recent log window
+                    all_keys = set()
+                    for d in kl_divergences[-args.log_step:]:
+                        all_keys.update(d.keys())
+
+                    # Compute per-key average safely
+                    avg_kl_dict = {
+                        key: np.mean([d[key] for d in kl_divergences[-args.log_step:] if key in d])
+                        for key in all_keys
+    }
+
+
+                # Print metrics
+                print(f"[{experiment_name} | Run {i}] Avg Reward: {avg_r:.4f} | Critic Loss: {avg_l:.6f} | Entropy: {avg_e:.4f} | Steps: {avg_s:.2f}")
+                for key, val in avg_kl_dict.items():
+                    print(f"  {key}: {val:.6f}")
+
+                # Save to log file
+                metrics = {
+                    "run_index": i,
+                    "avg_reward": avg_r,
+                    "avg_critic_loss": avg_l,
+                    "avg_entropy": np.float64(avg_e),
+                    "avg_step_count": np.float64(avg_s),
+                    **{k: np.float64(v) for k, v in avg_kl_dict.items()}
                 }
+
+                save_metrics(log_file, **metrics)
+
+
+                checkpoint = {
+                'actor_model_state_dict': actor_model.state_dict(),
+                'critic_model_state_dict': critic_model.state_dict(),
+                'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+                'critic_optimizer_state_dict': critic_optimizer.state_dict(),
+                'step': i
+                }       
 
                 torch.save(checkpoint, os.path.join(checkpoint_dir, f"checkpoint_step_{i}.pt"))
 
@@ -114,12 +176,13 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
             traceback.print_exc()
 
             # === Save in-memory episode traces ===
-            states, actions, rewards, log_probs, values = goat_agent.get_memory()
+            states, actions, rewards, log_probs,probs, values = goat_agent.get_memory()
             memory_trace = {
                 "states": states,
                 "actions": actions,
                 "rewards": rewards,
                 "log_probs": log_probs,
+                "probs": probs,
                 "values": values
             }
             memory_path = os.path.join(log_dir, f"episode_memory_step_{i}.pt")
@@ -128,9 +191,7 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
             break
 
 HYPERPARAMETER_TUPLES = [
-    (1e-5, 1e-4, 1e-5), # actor_lr, critic_lr, critic_weight_decay
-    (1e-4, 1e-3, 1e-4),
-    (1e-4, 1e-3, 1e-5)
+    (8e-5, 3e-4, 1e-5) # actor_lr, critic_lr, critic_weight_decay
 ]
 
 def main(args):
