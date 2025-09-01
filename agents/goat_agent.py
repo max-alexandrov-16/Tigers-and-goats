@@ -18,6 +18,9 @@ class ReinforceGoatAgent():
         self.reward_scheme = reward_scheme
         self.monitoring_state = None
         self.monitoring_distributions = []
+        self.monitoring_state_1 = None
+        self.monitoring_state_2 = None
+        self.monitoring_state_3 = None
     
 
     def update_policy(self, log_probs, rewards):
@@ -72,6 +75,7 @@ class ReinforceGoatAgent():
         """
         rewards = []
         log_probs = []
+
 
         for _ in range(self.max_number_of_turns):
             # Get current environment state and placement phase flag
@@ -251,33 +255,89 @@ class ActorCriticGoatAgent():
         self.goat_env = goat_env
         self.max_number_of_turns = max_number_of_turns
         self.reward_scheme = reward_scheme
-        self.monitoring_state = None
-        self.monitoring_distributions = []
+        self.monitoring_state_and_flag_1 = None
+        self.monitoring_state_and_flag_2 = None
+        self.monitoring_state_and_flag_3 = None
+        self.monitoring_distributions_1 = []
+        self.monitoring_distributions_2 = []
+        self.monitoring_distributions_3 = []
         self.states = []
         self.actions = []
         self.rewards = []
         self.log_probs = []
         self.values = []
+        self.probs = []
     
-
-    def update_actor(self, log_prob, advantage):
+    def normalize_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
         """
-        Performs a per-step actor update using the policy gradient and advantage estimate.
-        
-        Args:
+        Normalize a scalar advantage tensor using running mean/std.
+        Returns a 0-dim tensor on the same device, detached from autograd.
+        """
+        # Initialize stats on first call
+        if not hasattr(self, "_adv_stats"):
+            self._adv_stats = {
+                "n": 0,
+                "mean": 0.0,
+                "M2": 0.0,
+                "eps": 1e-8,
+                "warmup": 32,
+                "clip": 5.0,
+            }
+
+        stats = self._adv_stats
+        device = advantage.device
+
+        def std():
+            return ((stats["M2"] / (stats["n"] - 1)) + stats["eps"]) ** 0.5 if stats["n"] >= 2 else 1.0
+
+        # Convert to Python float for running stats update
+        x = float(advantage.detach().cpu().item())
+
+        # Normalize using current running mean/std
+        if stats["n"] < stats["warmup"]:
+            norm_x = x
+        else:
+            norm_x = (x - stats["mean"]) / std()
+            if stats["clip"] is not None:
+                norm_x = max(min(norm_x, stats["clip"]), -stats["clip"])
+
+        # Update running stats
+        stats["n"] += 1
+        delta = x - stats["mean"]
+        stats["mean"] += delta / stats["n"]
+        delta2 = x - stats["mean"]
+        stats["M2"] += delta * delta2
+
+        # Return as a detached tensor on the same device
+        return torch.tensor(norm_x, dtype=torch.float32, device=device, requires_grad=False)
+
+
+    def update_actor(self, log_prob, advantage, entropy, entropy_coef=0.025):
+        """
+        Performs a per-step actor update using policy gradient, advantage, and precomputed entropy.
+
+        Args: 
             log_prob (Tensor): Log probability of the action taken.
-            advantage (float or Tensor): Advantage estimate (e.g., from critic).
+            advantage (float or Tensor): Advantage estimate (single-step).
+            entropy (Tensor): Entropy of the policy at this step.
+            entropy_coef (float): Coefficient for entropy regularization.
         """
         self.actor_optimizer.zero_grad()
 
-        # Policy gradient loss using advantage
-        loss = -log_prob * advantage
+        # Normalize advantage
+        norm_advantage = self.normalize_advantage(advantage)
+
+        # Policy gradient loss
+        loss = -log_prob * norm_advantage
+
+        # Add entropy penalty
+        loss = loss - entropy_coef * entropy
+
+        # Backpropagate and clip gradients
         loss.backward()
-
-        # Gradient clipping to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
         self.actor_optimizer.step()
+
 
 
 
@@ -307,7 +367,7 @@ class ActorCriticGoatAgent():
         return loss
 
 
-    def learn(self):
+    def learn(self,record_monitoring_states = False):
         """
         Runs one training episode using the current policy. Collects states, actions, and rewards,
         and updates both actor and critic per step using TD-based advantage.
@@ -316,13 +376,17 @@ class ActorCriticGoatAgent():
             float: The average reward received during the episode.
         """
         total_reward = 0
+        total_critic_loss = 0
         step_count = 0
+        entropies = []
 
         for _ in range(self.max_number_of_turns):
             # Get current environment state and placement phase flag
             current_state = self.goat_env.return_state()
             self.states.append(np.copy(current_state))
             all_goats_placed_flag = self.goat_env.return_goat_placement_flag()
+            if record_monitoring_states:
+                self.collect_monitor_states(step_count, current_state, all_goats_placed_flag)
 
             # Predict the action using the policy
             goat_or_spot_action, goat_move_action, goat_or_spot_dist, goat_move_dist = self.predict_action(current_state, all_goats_placed_flag)
@@ -332,14 +396,16 @@ class ActorCriticGoatAgent():
             value = self.predict_value(current_state, all_goats_placed_flag)
             self.values.append(value.clone().detach().cpu().numpy())
             #print('forward prop critic')
-
+            step_entropy = goat_or_spot_dist.entropy()
             # Combine log probabilities depending on phase
             if goat_move_dist is not None:
+                step_entropy += goat_move_dist.entropy() 
                 log_prob = goat_or_spot_dist.log_prob(goat_or_spot_action) + goat_move_dist.log_prob(goat_move_action)
                 action = (goat_or_spot_action.item(), goat_move_action.item())
             else:
                 log_prob = goat_or_spot_dist.log_prob(goat_or_spot_action)
                 action = goat_or_spot_action.item()
+            entropies.append(step_entropy.mean().detach().cpu().numpy())
             self.actions.append(action)
             log_prob = log_prob.to(self.device)
             self.log_probs.append(log_prob.clone().detach().cpu().numpy())
@@ -364,18 +430,21 @@ class ActorCriticGoatAgent():
             advantage = reward + self.gamma * next_value.detach() - value.detach()
 
             # Update actor using advantage
-            self.update_actor(log_prob, advantage)
+            self.update_actor(log_prob, advantage, step_entropy)
             #print('updated actor')
 
             # Update critic to fit target value
             target_value = reward + self.gamma * next_value.detach()
+            # ensuring the size of input matches (0) the size of target (1)
+            value = torch.reshape(value, (1,))
             critic_loss = self.update_critic(value, target_value)
+            total_critic_loss += critic_loss
             #print('updated critic')
             if done:
                 break
 
         self.goat_env.reset()
-        return total_reward,critic_loss.item() if step_count > 0 else (0.0,0.0)
+        return total_reward,(total_critic_loss/step_count).item(),np.mean(entropies),step_count if step_count > 0 else (0.0,0.0,0.0,0.0)
 
     def clear_memory(self):
         self.states = []
@@ -383,14 +452,10 @@ class ActorCriticGoatAgent():
         self.rewards = []
         self.log_probs = []
         self.values = []
+        self.probs = [] 
 
     def get_memory(self):
-        return self.states, self.actions, self.rewards, self.log_probs, self.values
-      
-    def check_output(self):
-        current_state = self.tiger_env.return_state()
-        action_probs = self.model.predict_action(current_state)
-        print('raw action probs',action_probs)
+        return self.states, self.actions, self.rewards, self.log_probs,self.probs, self.values
 
     def _prepare_model_input(self, state, all_goats_placed_flag):
         """
@@ -453,6 +518,7 @@ class ActorCriticGoatAgent():
         # Get action probabilities from the model
         #print('model input',model_input)
         action_probs = self.actor.predict_probabilities(model_input)
+        self.probs.append(action_probs)
         #print('action probs',action_probs)
 
         # Separate probabilities into goat/spot selection and movement
@@ -510,10 +576,67 @@ class ActorCriticGoatAgent():
 
     def critic_load_model(self, model_path):
         self.critic.load_state_dict(torch.load(model_path))
-    
-    
 
+    def collect_monitor_states(self, step_count, state, all_goats_placed_flag):
+        if 5<step_count<10 and self.monitoring_state_and_flag_1 is None:
+            self.monitoring_state_and_flag_1 = (state, all_goats_placed_flag)    
 
-
-
+        if 10<step_count<15 and self.monitoring_state_and_flag_2 is None:
+            self.monitoring_state_and_flag_2 = (state, all_goats_placed_flag)
         
+        if 23<step_count<30 and self.monitoring_state_and_flag_3 is None:
+            self.monitoring_state_and_flag_3 = (state, all_goats_placed_flag)
+        
+        else:
+            pass
+
+    def monitor_KL_divergence_multiple_states(self, epsilon=1e-8):
+        """
+        Tracks KL divergence across 3 fixed (state, flag) pairs with epsilon smoothing to avoid infinite KL.
+        Assumes two categorical distributions per state.
+        Returns dictionary of KL divergence values per monitoring state.
+        """
+        kl_dict = {}
+
+        for i in range(1, 4):
+            state, flag = getattr(self, f"monitoring_state_and_flag_{i}")
+            _, _, goat_or_spot_dist, dist_move = self.predict_action(state, flag)
+
+            # Store distributions as a tuple (goat_or_spot_dist, dist_move)
+            dist_list = getattr(self, f"monitoring_distributions_{i}")
+            dist_list.append((goat_or_spot_dist, dist_move))
+
+            if len(dist_list) > 1:
+                prev_goat_or_spot_dist, prev_dist_move = dist_list[-2]
+                curr_goat_or_spot_dist, curr_dist_move = dist_list[-1]
+
+                # Smooth probabilities by clamping to [epsilon, 1.0]
+                def smooth_dist(dist):
+                    if dist is None:
+                        return None
+                    probs = torch.clamp(dist.probs, epsilon, 1.0)
+                    # Re-normalize to ensure sum to 1 after clamping
+                    probs = probs / probs.sum(dim=-1, keepdim=True)
+                    return torch.distributions.Categorical(probs=probs)
+
+                prev_goat_or_spot_dist_smooth = smooth_dist(prev_goat_or_spot_dist)
+                curr_goat_or_spot_dist_smooth = smooth_dist(curr_goat_or_spot_dist)
+
+                kl_or_spot = torch.distributions.kl.kl_divergence(curr_goat_or_spot_dist_smooth, prev_goat_or_spot_dist_smooth).mean()
+
+                if curr_dist_move is not None and prev_dist_move is not None:
+                    prev_dist_move_smooth = smooth_dist(prev_dist_move)
+                    curr_dist_move_smooth = smooth_dist(curr_dist_move)
+                    kl_move = torch.distributions.kl.kl_divergence(curr_dist_move_smooth, prev_dist_move_smooth).mean()
+                    kl_total = kl_or_spot + kl_move
+                else:
+                    kl_total = kl_or_spot
+
+                kl_dict[f"monitoring_state_{i}_KL"] = kl_total.item()
+
+        return kl_dict
+
+
+
+
+                

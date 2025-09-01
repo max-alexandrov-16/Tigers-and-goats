@@ -54,8 +54,10 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
     base_dir = os.path.join("experiments", experiment_name)
     checkpoint_dir = os.path.join(base_dir, "checkpoints")
     log_dir = os.path.join(base_dir, "logs")
+    probs_dir = os.path.join(base_dir, "probs")
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(probs_dir, exist_ok=True)
 
     config_path = os.path.join(base_dir, "config.json")
     config_dict = {
@@ -70,7 +72,7 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
     with open(config_path, "w") as f:
         json.dump(config_dict, f, indent=4)
 
-    log_file = os.path.join(log_dir, "metrics.jsonl")
+    log_file = os.path.join(log_dir, "metrics.json")
 
     goat_reward_scheme = {"winning": 1, "losing": -1, "eaten": -0.2}
     tiger_reward_scheme = {"eating": 0.1, "winning": 0.5, "losing": -0.5, "no score": 0}
@@ -109,6 +111,9 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
                 reward, critic_loss, entropy,length = goat_agent.learn(record_monitoring_states=False)
                 kl_div = goat_agent.monitor_KL_divergence_multiple_states()
                 kl_divergences.append(kl_div)
+
+            probs_memory_path = os.path.join(probs_dir, f"probs_run_{i}.pt")
+            torch.save(goat_agent.probs, probs_memory_path)
 
             goat_agent.clear_memory()
             avg_rewards.append(reward)
@@ -183,7 +188,7 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
                 "rewards": rewards,
                 "log_probs": log_probs,
                 "probs": probs,
-                "values": values
+                "values": values 
             }
             memory_path = os.path.join(log_dir, f"episode_memory_step_{i}.pt")
             torch.save(memory_trace, memory_path)
@@ -191,7 +196,7 @@ def run_single_experiment(actor_lr, critic_lr, critic_weight_decay, args, tag_su
             break
 
 HYPERPARAMETER_TUPLES = [
-    (8e-5, 3e-4, 1e-5) # actor_lr, critic_lr, critic_weight_decay
+    (5e-4, 1e-3, 1e-5) # actor_lr, critic_lr, critic_weight_decay
 ]
 
 def main(args):
